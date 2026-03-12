@@ -1,8 +1,8 @@
 name: pdf
-description: A pdf producer for Dart. It can create pdf files for both web or flutter.
-homepage: https://github.com/DavBfr/dart_pdf/tree/master/pdf
-repository: https://github.com/DavBfr/dart_pdf
-issue_tracker: https://github.com/DavBfr/dart_pdf/issues
+description: A pdf producer for Dart. Fork of dart_pdf with Indic shaper fix for correct Devanagari (Hindi) rendering via font-aware pre-base matra reordering.
+homepage: https://github.com/harshflow/dart_pdf_indic
+repository: https://github.com/harshflow/dart_pdf_indic
+issue_tracker: https://github.com/harshflow/dart_pdf_indic/issues
 screenshots:
   - description: 'Example of a generated document'
     path: example.jpg
@@ -12,7 +12,7 @@ topics:
   - print
   - printing
   - report
-version: 3.11.1
+version: 3.11.1+1
 
 environment:
   sdk: ">=2.19.0 <4.0.0"
