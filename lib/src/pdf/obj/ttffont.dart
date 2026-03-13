@@ -152,13 +152,14 @@ class PdfTtfFont extends PdfFont {
     charMax = unicodeCMap.cmap.length - 1;
     for (var i = charMin; i <= charMax; i++) {
       final glyphId = unicodeCMap.cmap[i];
-      // Mark glyphs (from GPOS MarkBasePos) get zero advance width in PDF;
-      // their positioning is handled entirely via TJ kerns + Ts in putText.
-      if (font.gposMarkGlyphs.contains(glyphId)) {
+      final origWidth = glyphMetrics(glyphId, true).advanceWidth;
+      // Only truly non-spacing marks (advance width ≈ 0) get zero width in
+      // /W; their positioning is handled via TJ kerns + Ts in putText.
+      // Spacing marks (like vowel signs े ै ो ौ) keep their original width.
+      if (font.gposMarkGlyphs.contains(glyphId) && origWidth < 0.05) {
         widthsObject.params.add(const PdfNum(0));
       } else {
-        widthsObject.params.add(PdfNum(
-            (glyphMetrics(glyphId, true).advanceWidth * 1000.0).toInt()));
+        widthsObject.params.add(PdfNum((origWidth * 1000.0).toInt()));
       }
     }
   }
@@ -200,7 +201,13 @@ class PdfTtfFont extends PdfFont {
       final hex = char.toRadixString(16).padLeft(4, '0');
 
       final markOffsets = font.gposMarkOffsets[glyphId];
-      if (markOffsets != null && baseIds.isNotEmpty) {
+      final glyphWidth = font.glyphInfoMap[glyphId]?.advanceWidth ?? 0.0;
+      // Only truly non-spacing marks (advance width ≈ 0) get kern+Ts
+      // positioning. Spacing marks render normally with their own width.
+      final isNonSpacingMark =
+          markOffsets != null && glyphWidth < 0.05;
+
+      if (isNonSpacingMark && baseIds.isNotEmpty) {
         // Scan backwards through base history to find one with GPOS data.
         List<int>? offset;
         double baseOrigin = 0;
@@ -229,17 +236,16 @@ class PdfTtfFont extends PdfFont {
         } else {
           stream.putString('<$hex>');
         }
-        // Mark has 0 advance width — penPos unchanged
+        // Non-spacing mark has 0 advance width — penPos unchanged
       } else {
+        // Spacing mark or base glyph — render normally
         stream.putString('<$hex>');
-        if (markOffsets == null) {
-          baseIds.add(glyphId);
-          baseOrigins.add(penPos);
-          penPos += font.glyphInfoMap[glyphId]?.advanceWidth ?? 0.0;
-          if (baseIds.length > 20) {
-            baseIds.removeAt(0);
-            baseOrigins.removeAt(0);
-          }
+        baseIds.add(glyphId);
+        baseOrigins.add(penPos);
+        penPos += glyphWidth;
+        if (baseIds.length > 20) {
+          baseIds.removeAt(0);
+          baseOrigins.removeAt(0);
         }
       }
     }
@@ -251,11 +257,19 @@ class PdfTtfFont extends PdfFont {
       return super.stringMetrics(s, letterSpacing: letterSpacing);
     }
 
-    final runes = s.runes;
-    final bytes = <int>[];
-    runes.forEach(bytes.add);
+    // Use shaped glyphs so metrics match what putText actually renders
+    // (GSUB conjuncts, mark widths, etc.).
+    var charIndexes = getCharIndexes(s.runes);
+    charIndexes = indicShaper(charIndexes, font);
 
-    final metrics = bytes.map(glyphMetrics);
+    final metrics = charIndexes.map<PdfFontMetrics>((glyphId) {
+      final m = glyphMetrics(glyphId, true);
+      // Non-spacing GPOS marks get 0 width (matching /W array behavior).
+      if (font.gposMarkGlyphs.contains(glyphId) && m.advanceWidth < 0.05) {
+        return m.copyWith(advanceWidth: 0);
+      }
+      return m;
+    });
     return PdfFontMetrics.append(metrics, letterSpacing: letterSpacing);
   }
 
