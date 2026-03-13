@@ -196,6 +196,15 @@ class TtfParser {
   GsubTableParser? gsub;
   GDEFParser? gdef;
 
+  /// Pre-computed mark-to-base offsets from GPOS MarkBasePos lookups.
+  /// markGlyphId → { baseGlyphId → [dx, dy] } in font design units.
+  /// dx/dy = baseAnchor - markAnchor (the offset to apply to the mark origin).
+  /// First lookup wins (putIfAbsent) per the OpenType spec.
+  final gposMarkOffsets = <int, Map<int, List<int>>>{};
+
+  /// Set of all mark glyph IDs found in GPOS (used for zero-width in /W).
+  final gposMarkGlyphs = <int>{};
+
   int get unitsPerEm => bytes.getUint16(tableOffsets[head_table]! + 18);
 
   int get xMin => bytes.getInt16(tableOffsets[head_table]! + 36);
@@ -671,7 +680,133 @@ class TtfParser {
     gsub = GsubTableParser(data: bytes, startPosition: basePosition);
   }
 
-  void _parseGpos() {}
+  // ---------------------------------------------------------------------------
+  // GPOS parsing — extracts mark-to-base y-offsets for above-base marks
+  // (LookupType 4 MarkBasePosFormat1).  Only the y component is needed to
+  // implement text-rise (Ts) positioning; x is handled by font advance widths.
+  // ---------------------------------------------------------------------------
+
+  List<int> _parseCoverage(int offset) {
+    final result = <int>[];
+    try {
+      final format = bytes.getUint16(offset);
+      if (format == 1) {
+        final count = bytes.getUint16(offset + 2);
+        for (var i = 0; i < count; i++) {
+          result.add(bytes.getUint16(offset + 4 + i * 2));
+        }
+      } else if (format == 2) {
+        final rangeCount = bytes.getUint16(offset + 2);
+        for (var i = 0; i < rangeCount; i++) {
+          final start = bytes.getUint16(offset + 4 + i * 6);
+          final end = bytes.getUint16(offset + 6 + i * 6);
+          for (var g = start; g <= end; g++) {
+            result.add(g);
+          }
+        }
+      }
+    } catch (_) {}
+    return result;
+  }
+
+  int _anchorX(int anchorOffset) {
+    if (anchorOffset == 0) return 0;
+    final fmt = bytes.getUint16(anchorOffset);
+    if (fmt < 1 || fmt > 3) return 0;
+    return bytes.getInt16(anchorOffset + 2); // x is at byte offset +2
+  }
+
+  int _anchorY(int anchorOffset) {
+    if (anchorOffset == 0) return 0;
+    final fmt = bytes.getUint16(anchorOffset);
+    if (fmt < 1 || fmt > 3) return 0;
+    return bytes.getInt16(anchorOffset + 4); // y is at byte offset +4
+  }
+
+  void _parseGpos() {
+    try {
+      final gposBase = tableOffsets[gpos_table]!;
+      final lookupListOffset = gposBase + bytes.getUint16(gposBase + 8);
+      final lookupCount = bytes.getUint16(lookupListOffset);
+
+      for (var li = 0; li < lookupCount; li++) {
+        final lookupOffset =
+            lookupListOffset + bytes.getUint16(lookupListOffset + 2 + li * 2);
+        final lookupType = bytes.getUint16(lookupOffset);
+        final subCount = bytes.getUint16(lookupOffset + 4);
+        if (lookupType != 4) continue; // 4 = MarkBasePosFormat1
+
+        for (var si = 0; si < subCount; si++) {
+          final subOffset =
+              lookupOffset + bytes.getUint16(lookupOffset + 6 + si * 2);
+          if (bytes.getUint16(subOffset) != 1) continue; // only Format 1
+
+          final markCov = subOffset + bytes.getUint16(subOffset + 2);
+          final baseCov = subOffset + bytes.getUint16(subOffset + 4);
+          final classCount = bytes.getUint16(subOffset + 6);
+          final markArray = subOffset + bytes.getUint16(subOffset + 8);
+          final baseArray = subOffset + bytes.getUint16(subOffset + 10);
+
+          final markGlyphs = _parseCoverage(markCov);
+          final baseGlyphs = _parseCoverage(baseCov);
+          final markCount = bytes.getUint16(markArray);
+          final baseCount = bytes.getUint16(baseArray);
+
+          // Parse all mark records within this subtable (local class numbering).
+          final markRecords = <int, List<int>>{}; // markGlyphId → [class, x, y]
+          for (var mi = 0; mi < markCount && mi < markGlyphs.length; mi++) {
+            final markGlyphId = markGlyphs[mi];
+            final recOffset = markArray + 2 + mi * 4;
+            final markClass = bytes.getUint16(recOffset);
+            final anchorRelOff = bytes.getUint16(recOffset + 2);
+            if (anchorRelOff == 0) continue;
+            final absMarkOff = markArray + anchorRelOff;
+            markRecords[markGlyphId] = [
+              markClass,
+              _anchorX(absMarkOff),
+              _anchorY(absMarkOff),
+            ];
+          }
+
+          // For each base glyph, compute per mark+base pair offsets.
+          // Class numbers are LOCAL to this subtable, so we resolve them here.
+          for (var bi = 0; bi < baseCount && bi < baseGlyphs.length; bi++) {
+            final baseGlyphId = baseGlyphs[bi];
+            final baseAnchors = <int, List<int>>{}; // class → [x, y]
+            for (var cls = 0; cls < classCount; cls++) {
+              final anchorRelOff = bytes.getUint16(
+                  baseArray + 2 + bi * classCount * 2 + cls * 2);
+              if (anchorRelOff == 0) continue;
+              final absOff = baseArray + anchorRelOff;
+              baseAnchors[cls] = [_anchorX(absOff), _anchorY(absOff)];
+            }
+
+            for (final markEntry in markRecords.entries) {
+              final markGlyphId = markEntry.key;
+              final markClass = markEntry.value[0];
+              final markAnchorX = markEntry.value[1];
+              final markAnchorY = markEntry.value[2];
+
+              final baseAnchor = baseAnchors[markClass];
+              if (baseAnchor == null) continue;
+
+              final dx = baseAnchor[0] - markAnchorX;
+              final dy = baseAnchor[1] - markAnchorY;
+
+              gposMarkGlyphs.add(markGlyphId);
+              gposMarkOffsets
+                  .putIfAbsent(markGlyphId, () => <int, List<int>>{});
+              // First lookup wins per OpenType spec.
+              gposMarkOffsets[markGlyphId]!
+                  .putIfAbsent(baseGlyphId, () => [dx, dy]);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // GPOS parsing failed — continue without mark positioning.
+    }
+  }
 
   void _parseGdef() {
     final int basePosition = tableOffsets[gdef_table]!;

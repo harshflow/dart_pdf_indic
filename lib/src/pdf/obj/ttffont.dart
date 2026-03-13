@@ -151,9 +151,15 @@ class PdfTtfFont extends PdfFont {
     charMin = 0;
     charMax = unicodeCMap.cmap.length - 1;
     for (var i = charMin; i <= charMax; i++) {
-      widthsObject.params.add(PdfNum(
-          (glyphMetrics(unicodeCMap.cmap[i], true).advanceWidth * 1000.0)
-              .toInt()));
+      final glyphId = unicodeCMap.cmap[i];
+      // Mark glyphs (from GPOS MarkBasePos) get zero advance width in PDF;
+      // their positioning is handled entirely via TJ kerns + Ts in putText.
+      if (font.gposMarkGlyphs.contains(glyphId)) {
+        widthsObject.params.add(const PdfNum(0));
+      } else {
+        widthsObject.params.add(PdfNum(
+            (glyphMetrics(glyphId, true).advanceWidth * 1000.0).toInt()));
+      }
     }
   }
 
@@ -169,26 +175,74 @@ class PdfTtfFont extends PdfFont {
   }
 
   @override
-  void putText(PdfStream stream, String text) {
+  void putText(PdfStream stream, String text, {double fontSize = 12.0}) {
     if (!font.unicode) {
-      super.putText(stream, text);
+      super.putText(stream, text, fontSize: fontSize);
+      return;
     }
 
     var charIndexes = getCharIndexes(text.runes);
     charIndexes = indicShaper(charIndexes, font);
-    final runes = charIndexes;
 
-    stream.putByte(0x3c);
-    for (final rune in runes) {
-      var char = unicodeCMap.cmap.indexOf(rune);
+    final upm = font.unitsPerEm;
+    // Cumulative pen position (in em units) from the start of this text run.
+    double penPos = 0;
+    // History of non-mark (base) glyphs: glyph ID and its x-origin.
+    final baseIds = <int>[];
+    final baseOrigins = <double>[];
+
+    for (final glyphId in charIndexes) {
+      var char = unicodeCMap.cmap.indexOf(glyphId);
       if (char == -1) {
         char = unicodeCMap.cmap.length;
-        unicodeCMap.cmap.add(rune);
+        unicodeCMap.cmap.add(glyphId);
       }
+      final hex = char.toRadixString(16).padLeft(4, '0');
 
-      stream.putBytes(latin1.encode(char.toRadixString(16).padLeft(4, '0')));
+      final markOffsets = font.gposMarkOffsets[glyphId];
+      if (markOffsets != null && baseIds.isNotEmpty) {
+        // Scan backwards through base history to find one with GPOS data.
+        List<int>? offset;
+        double baseOrigin = 0;
+        for (var j = baseIds.length - 1; j >= 0; j--) {
+          offset = markOffsets[baseIds[j]];
+          if (offset != null) {
+            baseOrigin = baseOrigins[j];
+            break;
+          }
+        }
+
+        if (offset != null) {
+          final xOffset = offset[0] / upm;
+          final yOffset = offset[1] / upm;
+          final markTargetX = baseOrigin + xOffset;
+          final kBefore = (penPos - markTargetX) * 1000;
+          final kAfter = -kBefore;
+          final yPts = (yOffset * fontSize).toStringAsFixed(2);
+          final kB = kBefore.toStringAsFixed(1);
+          final kA = kAfter.toStringAsFixed(1);
+
+          stream.putString(' $kB] TJ ');
+          stream.putString('$yPts Ts ');
+          stream.putString('[$kA <$hex>] TJ ');
+          stream.putString('0 Ts [');
+        } else {
+          stream.putString('<$hex>');
+        }
+        // Mark has 0 advance width — penPos unchanged
+      } else {
+        stream.putString('<$hex>');
+        if (markOffsets == null) {
+          baseIds.add(glyphId);
+          baseOrigins.add(penPos);
+          penPos += font.glyphInfoMap[glyphId]?.advanceWidth ?? 0.0;
+          if (baseIds.length > 20) {
+            baseIds.removeAt(0);
+            baseOrigins.removeAt(0);
+          }
+        }
+      }
     }
-    stream.putByte(0x3e);
   }
 
   @override

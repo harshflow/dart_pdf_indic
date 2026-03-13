@@ -63,7 +63,39 @@ initialReorder(List<int> glyphIndexes, String lang, TtfParser font) {
   return glyphIndexes;
 }
 
-finalReorder(List<int> glyphIndexes, String lang, TtfParser font) {
+finalReorder(List<int> glyphIndexes, String lang, TtfParser font,
+    [int? rephGlyph]) {
+  if (lang == 'hindi' && rephGlyph != null) {
+    // Build set of Devanagari post-base matra glyph IDs so we can skip
+    // past them when repositioning reph to the end of the syllable.
+    final matraGlyphs = <int>{};
+    for (final entry in font.charToGlyphIndexMap.entries) {
+      final cp = entry.key;
+      // Dependent vowel signs (U+093E..U+094F), vedic signs (U+0962..U+0963),
+      // anusvara (U+0902), visarga (U+0903)
+      if ((cp >= 0x093E && cp <= 0x094F) ||
+          (cp >= 0x0962 && cp <= 0x0963) ||
+          cp == 0x0902 ||
+          cp == 0x0903) {
+        matraGlyphs.add(entry.value);
+      }
+    }
+
+    for (var i = 0; i < glyphIndexes.length; i++) {
+      if (glyphIndexes[i] == rephGlyph) {
+        glyphIndexes.removeAt(i);
+        // i now points to the base consonant. Skip past it and any
+        // following post-base matras to place reph at the syllable end.
+        var j = i + 1;
+        while (j < glyphIndexes.length &&
+            matraGlyphs.contains(glyphIndexes[j])) {
+          j++;
+        }
+        glyphIndexes.insert(j, rephGlyph);
+        i = j; // skip past the inserted reph
+      }
+    }
+  }
   for (var i = 0; i < glyphIndexes.length; i++) {
     final glyphIndex = glyphIndexes[i];
     if (lang == 'tamil') {
@@ -103,7 +135,10 @@ var FRACTIONAL_FEATURES = ['frac', 'numr', 'dnom'];
 var COMMON_FEATURES = ['rlig', 'mark', 'mkmk'];
 var HORIZONTAL_FEATURES = ['calt', 'clig', 'liga', 'rclt', 'curs', 'kern'];
 
-setupStages() {
+// rephGlyphRef is a single-element list used as a mutable reference.
+// The closure captures the list, so it reads rephGlyphRef[0] at call-time
+// (after the rphf stage has populated it), not at setup-time.
+setupStages(List<int?> rephGlyphRef) {
   final stages = <dynamic>[];
   stages.add([
     ...VARIATION_FEATURES,
@@ -124,7 +159,8 @@ setupStages() {
   stages.add(['vatu']);
   stages.add(['cjct']);
   stages.add(['cfar']);
-  stages.add(finalReorder);
+  stages.add((List<int> glyphs, String lang, TtfParser font) =>
+      finalReorder(glyphs, lang, font, rephGlyphRef[0]));
   stages.add([
     'pres',
     'abvs',
@@ -154,8 +190,14 @@ indicShaper(List<int> glyphIndexes, TtfParser font) {
   final lang = getLang(font.fontName);
   if (isIndicShaperSupported(lang)) {
     final features = getFeatureMap(font);
-    final stages = setupStages();
+
+    // Mutable ref so the finalReorder closure picks up the reph glyph detected
+    // after the rphf stage runs (Dart closures capture by reference).
+    final rephGlyphRef = <int?>[null];
+    final stages = setupStages(rephGlyphRef);
+
     for (var stage in stages) {
+      final beforeGlyphs = List<int>.from(glyphIndexes);
       final glyphIterator = GlyphIterator(font, glyphIndexes);
       if (stage is Function(List<int>, String, TtfParser)) {
         glyphIndexes = stage(glyphIndexes, lang, font);
@@ -164,6 +206,20 @@ indicShaper(List<int> glyphIndexes, TtfParser font) {
         final lookups = ot.lookupsForFeatures(stage, features);
         ot.applyLookups(lookups);
         glyphIndexes = ot.glyphIterator.glyphs.map((g) => g.id).toList();
+
+        // After rphf stage runs, detect the reph glyph: it's any glyph in the
+        // output that wasn't present in the input (i.e. a new substituted glyph).
+        if (lang == 'hindi' &&
+            rephGlyphRef[0] == null &&
+            stage.contains('rphf')) {
+          final beforeSet = beforeGlyphs.toSet();
+          for (final g in glyphIndexes) {
+            if (!beforeSet.contains(g)) {
+              rephGlyphRef[0] = g;
+              break;
+            }
+          }
+        }
       }
     }
   }

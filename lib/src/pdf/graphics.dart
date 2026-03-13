@@ -556,7 +556,7 @@ class PdfGraphics {
     }());
 
     _buf.putString('[');
-    font.putText(_buf, s);
+    font.putText(_buf, s, fontSize: size);
     _buf.putString(']TJ ');
 
     assert(() {

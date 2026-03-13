@@ -331,7 +331,7 @@ See https://github.com/DavBfr/dart_pdf/wiki/Fonts-Management
   String toString() => 'Font($fontName)';
 
   /// Draw some text
-  void putText(PdfStream stream, String text) {
+  void putText(PdfStream stream, String text, {double fontSize = 12.0}) {
     try {
       PdfString(latin1.encode(text),
               format: PdfStringFormat.literal, encrypted: false)
